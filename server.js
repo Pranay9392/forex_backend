@@ -1,215 +1,250 @@
 const express = require('express');
-const cors = require('cors');
-const mongoose = require('mongoose');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const http = require('http');
-const { Server } = require('socket.io');
+const { Server: SocketIOServer } = require('socket.io');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
-
-// Provided MongoDB URI
-const MONGO_URI = 'mongodb://localhost:27017/forex_trading_app';
-const JWT_SECRET = 'your-super-strong-jwt-secret'; // IMPORTANT: Change this in a real application
-const EXCHANGERATE_API_KEY = '8054406b211345b306fc684e';
+const cors = require('cors');  // 👈 add this
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: '*',
-  }
-});
 
-const PORT = 3000;
+// ✅ Allow both frontend ports (3000 & 3001) or just one during dev
+const allowedOrigins = ["http://localhost:3000", "http://localhost:3001"];
 
-// Middleware
-app.use(cors());
+app.use(cors({
+    origin: allowedOrigins,
+    credentials: true
+}));
 app.use(express.json());
 
-// Connect to MongoDB
-const connectDB = async () => {
-  try {
-    await mongoose.connect(MONGO_URI);
-    console.log('MongoDB connected successfully!');
-  } catch (error) {
-    console.error('MongoDB connection error:', error);
-    process.exit(1); // Exit process with failure
-  }
-};
-
-// Define Mongoose Schemas and Models
-const userSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
+// ✅ Configure Socket.IO CORS
+const io = new SocketIOServer(server, {
+    cors: {
+        origin: allowedOrigins,
+        methods: ["GET", "POST"],
+    },
 });
-const User = mongoose.model('User', userSchema);
+
+
+// Local MongoDB URI from user input
+const MONGO_URI = "mongodb://localhost:27017/forex_trading_app";
+const JWT_SECRET = 'your_jwt_secret_key'; // Replace with a secure key in production
+const API_KEY = "YOUR_API_KEY_HERE"; // This is not needed for the free version of v4, but kept for consistency
+const BASE_URL = `https://api.exchangerate-api.com/v4/latest`;
+
+mongoose.connect(MONGO_URI)
+    .then(() => console.log('MongoDB connected successfully'))
+    .catch(err => console.error('MongoDB connection error:', err));
+
+// Database Schemas
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    wallet: {
+        type: Map,
+        of: Number,
+        default: { USD: 10000, EUR: 0, GBP: 0, JPY: 0, INR: 0 }
+    }
+});
+
+userSchema.pre('save', async function(next) {
+    if (this.isModified('password')) {
+        this.password = await bcrypt.hash(this.password, 10);
+    }
+    next();
+});
 
 const tradeSchema = new mongoose.Schema({
-  orderId: { type: String, required: true, unique: true },
-  currencyPair: { type: String, required: true },
-  action: { type: String, required: true },
-  price: { type: Number, required: true },
-  quantity: { type: Number, required: true },
-  status: { type: String, required: true },
-  timestamp: { type: Number, required: true },
-  profit: { type: Number, default: 0 }
+    orderId: { type: String, required: true, unique: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    currencyPair: { type: String, required: true },
+    action: { type: String, required: true },
+    price: { type: Number, required: true },
+    quantity: { type: Number, required: true },
+    status: { type: String, required: true },
+    timestamp: { type: Date, default: Date.now },
+    profit: { type: Number, default: 0 }
 });
+
+const User = mongoose.model('User', userSchema);
 const Trade = mongoose.model('Trade', tradeSchema);
 
-// Middleware for token authentication
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (token == null) return res.sendStatus(401);
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user;
-    next();
-  });
+// JWT Authentication Middleware
+const auth = (req, res, next) => {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) {
+        return res.status(401).send({ error: 'Authentication required.' });
+    }
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (err) {
+        res.status(401).send({ error: 'Invalid token.' });
+    }
 };
 
-// --- REST API Endpoints ---
-
-// User Signup
+// API Endpoints
 app.post('/api/signup', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const user = new User({ username, password: hashedPassword });
-    await user.save();
-    res.status(201).json({ message: 'User created successfully' });
-  } catch (error) {
-    res.status(400).json({ error: 'Username already exists or invalid input' });
-  }
+    try {
+        const { username, password } = req.body;
+        const user = new User({ username, password });
+        await user.save();
+        const token = jwt.sign({ _id: user._id, username: user.username }, JWT_SECRET);
+        res.status(201).send({ username: user.username, token });
+    } catch (err) {
+        res.status(400).send({ error: 'Username already exists or invalid data.' });
+    }
 });
 
-// User Login
 app.post('/api/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid username or password' });
-    }
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(401).json({ error: 'Invalid username or password' });
-    }
-    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({ token, username: user.username });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to log in' });
-  }
-});
-
-// API endpoint to place a new trade (protected)
-app.post('/api/trades', authenticateToken, async (req, res) => {
-  try {
-    const tradeData = req.body;
-    
-    // Simulate a successful trade
-    const newTrade = new Trade({
-      ...tradeData,
-      orderId: crypto.randomUUID(),
-      status: 'Filled',
-      timestamp: Date.now(),
-      profit: Math.random() * 10 - 5 // Simulate a profit/loss between -$5 and +$5
-    });
-
-    await newTrade.save();
-
-    console.log("Trade placed successfully:", newTrade.orderId);
-    res.status(201).json(newTrade);
-  } catch (error) {
-    console.error("Error placing trade:", error);
-    res.status(500).json({ error: 'Failed to place trade' });
-  }
-});
-
-// API endpoint to get all trades (protected)
-app.get('/api/trades', authenticateToken, async (req, res) => {
     try {
-        const trades = await Trade.find({}).sort({ timestamp: -1 });
-        res.status(200).json(trades);
-    } catch (error) {
-        console.error("Error fetching trades:", error);
-        res.status(500).json({ error: 'Failed to fetch trades' });
+        const { username, password } = req.body;
+        const user = await User.findOne({ username });
+        if (!user || !(await bcrypt.compare(password, user.password))) {
+            return res.status(400).send({ error: 'Invalid login credentials.' });
+        }
+        const token = jwt.sign({ _id: user._id, username: user.username }, JWT_SECRET);
+        res.status(200).send({ username: user.username, token });
+    } catch (err) {
+        res.status(500).send({ error: 'Server error during login.' });
     }
 });
 
-// API endpoint to get user's analytics (protected)
-app.get('/api/analytics', authenticateToken, async (req, res) => {
-  try {
-    const trades = await Trade.find({});
-    
-    const totalVolume = trades.reduce((sum, trade) => sum + trade.quantity, 0);
-    const totalProfit = trades.reduce((sum, trade) => sum + trade.profit, 0);
-    const totalTradesCount = trades.length;
-
-    res.status(200).json({
-      totalVolume,
-      totalProfit,
-      totalTradesCount
-    });
-  } catch (error) {
-    console.error("Error fetching analytics:", error);
-    res.status(500).json({ error: 'Failed to fetch analytics' });
-  }
+app.get('/api/wallet', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id).select('wallet');
+        if (!user) {
+            return res.status(404).send({ error: 'User not found.' });
+        }
+        res.status(200).send(user.wallet);
+    } catch (err) {
+        res.status(500).send({ error: 'Server error fetching wallet.' });
+    }
 });
 
-// --- WebSocket Handlers ---
+app.post('/api/trades', auth, async (req, res) => {
+    try {
+        const { currencyPair, action, price, quantity } = req.body;
+        const [base, quote] = currencyPair.split('/');
+        const user = await User.findById(req.user._id);
+
+        if (!user) {
+            return res.status(404).send({ error: 'User not found.' });
+        }
+        if (user.wallet.get(base) === undefined || user.wallet.get(quote) === undefined) {
+            return res.status(400).send({ error: 'Invalid currency pair in wallet.' });
+        }
+
+        const tradeVolume = price * quantity;
+        let profit = 0;
+
+        if (action === 'Buy') {
+            if (user.wallet.get(base) < tradeVolume) {
+                return res.status(400).send({ error: `Insufficient ${base} funds for this trade.` });
+            }
+            user.wallet.set(base, user.wallet.get(base) - tradeVolume);
+            user.wallet.set(quote, user.wallet.get(quote) + quantity);
+        } else if (action === 'Sell') {
+            if (user.wallet.get(quote) < quantity) {
+                return res.status(400).send({ error: `Insufficient ${quote} funds for this trade.` });
+            }
+            user.wallet.set(base, user.wallet.get(base) + tradeVolume);
+            user.wallet.set(quote, user.wallet.get(quote) - quantity);
+            
+            // For simplicity, profit is calculated based on the difference between the trade price and a simple 0.05% change
+            // A more complex system would track entry price and multiple positions.
+            const profitLossValue = tradeVolume * (Math.random() * 0.001 - 0.0005); // A small random profit/loss
+            profit = profitLossValue;
+            user.wallet.set(base, user.wallet.get(base) + profit); // Add profit/loss to the wallet
+        } else {
+            return res.status(400).send({ error: 'Invalid trade action.' });
+        }
+
+        await user.save();
+
+        const trade = new Trade({
+            orderId: uuidv4(),
+            userId: user._id,
+            currencyPair,
+            action,
+            price,
+            quantity,
+            status: 'FILLED',
+            profit
+        });
+        await trade.save();
+        
+        res.status(201).send(trade);
+    } catch (err) {
+        console.error("Trade error:", err);
+        res.status(500).send({ error: 'Server error placing trade.' });
+    }
+});
+
+app.get('/api/trades', auth, async (req, res) => {
+    try {
+        const trades = await Trade.find({ userId: req.user._id }).sort({ timestamp: -1 });
+        res.status(200).send(trades);
+    } catch (err) {
+        res.status(500).send({ error: 'Server error fetching trades.' });
+    }
+});
+
+// WebSocket for real-time data streaming
+let currentRates = null;
+
+const fetchAndBroadcastRates = async (baseCurrency = 'USD') => {
+    try {
+        // Updated API call to use v4 endpoint
+        const response = await axios.get(`${BASE_URL}/${baseCurrency}`);
+        
+        if (response.data.rates) {
+            currentRates = response.data.rates;
+            io.sockets.emit('latest_rates_update', {
+                base: baseCurrency,
+                conversion_rates: currentRates
+            });
+            console.log(`Broadcasted latest rates for ${baseCurrency} to all clients.`);
+        } else {
+            io.sockets.emit('error', 'Invalid API response format.');
+        }
+
+    } catch (error) {
+        console.error('API call error:', error.message);
+        io.sockets.emit('error', 'Failed to fetch currency rates from API.');
+    }
+};
+
+// Fetch and broadcast initial data immediately and then on a recurring interval
+fetchAndBroadcastRates();
+setInterval(fetchAndBroadcastRates, 60000); // Fetch every 60 seconds to avoid rate limits
+
 io.on('connection', (socket) => {
-  console.log('A user connected via WebSocket');
-
-  // Request latest rates for a base currency
-  socket.on('request_latest_rates', async (baseCurrency) => {
-    try {
-      const response = await axios.get(`https://v6.exchangerate-api.com/v6/${EXCHANGERATE_API_KEY}/latest/${baseCurrency}`);
-      socket.emit('latest_rates_update', response.data);
-    } catch (error) {
-      console.error('Error fetching latest rates:', error);
-      socket.emit('error', 'Failed to fetch latest rates.');
-    }
-  });
-
-  // Request historical rates for a base currency (simulated for demo)
-  socket.on('request_historical_data', (data) => {
-    console.log(`Received request for historical data: ${JSON.stringify(data)}`);
-    const { baseCurrency, dateRange } = data;
-    const historicalRates = [];
-    const endDate = new Date();
-    for (let i = 0; i < 30; i++) {
-        const date = new Date();
-        date.setDate(endDate.getDate() - i);
-        historicalRates.push({
-            date: date.toISOString().split('T')[0],
-            rate: 1.2 + (Math.random() - 0.5) * 0.1, // Simulated rates
+    console.log('New client connected to internal WebSocket');
+    
+    // Send the most recently fetched data to the newly connected client
+    if (currentRates) {
+        socket.emit('latest_rates_update', {
+            base: 'USD',
+            conversion_rates: currentRates
         });
     }
-    socket.emit('historical_data_update', historicalRates);
-  });
 
-  // Request list of all currencies
-  socket.on('request_currencies', async () => {
-    try {
-      const response = await axios.get(`https://v6.exchangerate-api.com/v6/${EXCHANGERATE_API_KEY}/latest/USD`);
-      const currencies = Object.keys(response.data.conversion_rates);
-      socket.emit('currencies_list', currencies);
-    } catch (error) {
-      console.error('Error fetching currencies:', error);
-      socket.emit('error', 'Failed to fetch currency list.');
-    }
-  });
+    // This listener is now used to trigger a data refresh for a specific currency
+    socket.on('request_latest_rates', (baseCurrency) => {
+        console.log(`Client requested rates for base currency: ${baseCurrency}`);
+        fetchAndBroadcastRates(baseCurrency);
+    });
 
-  socket.on('disconnect', () => {
-    console.log('A user disconnected');
-  });
+    socket.on('disconnect', () => {
+        console.log('Client disconnected from internal WebSocket');
+    });
 });
 
-// Start the server after connecting to the database
-connectDB().then(() => {
-  server.listen(PORT, () => {
-    console.log(`Express server listening at http://localhost:${PORT}`);
-  });
+server.listen(5000, () => {
+    console.log('Server is running on http://localhost:5000');
 });
