@@ -32,7 +32,7 @@ const io = new SocketIOServer(server, {
 // Local MongoDB URI from user input
 const MONGO_URI = "mongodb://localhost:27017/forex_trading_app";
 const JWT_SECRET = 'your_jwt_secret_key'; // Replace with a secure key in production
-const API_KEY = "YOUR_API_KEY_HERE"; // This is not needed for the free version of v4, but kept for consistency
+const API_KEY = "8054406b211345b306fc684e";
 const BASE_URL = `https://api.exchangerate-api.com/v4/latest`;
 
 mongoose.connect(MONGO_URI)
@@ -196,19 +196,72 @@ app.get('/api/trades', auth, async (req, res) => {
 
 // WebSocket for real-time data streaming
 let currentRates = null;
+let pricesHistory = []; // Store price history for indicator calculations
+
+const calculateSMA = (prices, period) => {
+    if (prices.length < period) return prices.reduce((sum, p) => sum + p, 0) / prices.length;
+    const slice = prices.slice(-period);
+    return slice.reduce((sum, p) => sum + p, 0) / period;
+};
+
+const calculateRSI = (prices, period = 14) => {
+    if (prices.length < period + 1) return 50;
+    const changes = prices.slice(1).map((p, i) => p - prices[i]);
+    const gains = changes.filter(c => c > 0);
+    const losses = changes.filter(c => c < 0).map(c => Math.abs(c));
+
+    const avgGain = gains.slice(0, period).reduce((sum, g) => sum + g, 0) / period;
+    const avgLoss = losses.slice(0, period).reduce((sum, l) => sum + l, 0) / period;
+    
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+};
+
+const getPredictionFromML = async (features) => {
+    try {
+        const response = await axios.post('http://localhost:8000/predict', features);
+        return response.data.recommendation;
+    } catch (error) {
+        console.error('Error calling Python ML API:', error.message);
+        return 'Hold';
+    }
+};
 
 const fetchAndBroadcastRates = async (baseCurrency = 'USD') => {
     try {
-        // Updated API call to use v4 endpoint
         const response = await axios.get(`${BASE_URL}/${baseCurrency}`);
         
         if (response.data.rates) {
             currentRates = response.data.rates;
+
+            // Update price history for indicators
+            const currentPrice = currentRates.INR;
+            pricesHistory.push(currentPrice);
+            if (pricesHistory.length > 50) pricesHistory.shift();
+
+            // Calculate features for ML prediction
+            const mockFeatures = {
+                Close: currentPrice,
+                SMA10: calculateSMA(pricesHistory, 10),
+                SMA50: calculateSMA(pricesHistory, 50),
+                EMA20: currentPrice, // Mocking EMA
+                RSI14: calculateRSI(pricesHistory, 14),
+                ATR14: 1.0, // Mocking ATR
+                BBand_Upper: 80.0, // Mocking BB
+                BBand_Lower: 70.0, // Mocking BB
+                Volatility20: 0.5, // Mocking Volatility
+            };
+            
+            // Get prediction from the Python service
+            const mlRecommendation = await getPredictionFromML(mockFeatures);
+
             io.sockets.emit('latest_rates_update', {
                 base: baseCurrency,
-                conversion_rates: currentRates
+                conversion_rates: currentRates,
+                ml_recommendation: mlRecommendation,
             });
-            console.log(`Broadcasted latest rates for ${baseCurrency} to all clients.`);
+            console.log(`Broadcasted latest rates and ML recommendation (${mlRecommendation}) to all clients.`);
         } else {
             io.sockets.emit('error', 'Invalid API response format.');
         }
@@ -219,22 +272,20 @@ const fetchAndBroadcastRates = async (baseCurrency = 'USD') => {
     }
 };
 
-// Fetch and broadcast initial data immediately and then on a recurring interval
 fetchAndBroadcastRates();
-setInterval(fetchAndBroadcastRates, 60000); // Fetch every 60 seconds to avoid rate limits
+setInterval(fetchAndBroadcastRates, 60000);
 
 io.on('connection', (socket) => {
     console.log('New client connected to internal WebSocket');
     
-    // Send the most recently fetched data to the newly connected client
     if (currentRates) {
         socket.emit('latest_rates_update', {
             base: 'USD',
-            conversion_rates: currentRates
+            conversion_rates: currentRates,
+            ml_recommendation: 'Hold'
         });
     }
 
-    // This listener is now used to trigger a data refresh for a specific currency
     socket.on('request_latest_rates', (baseCurrency) => {
         console.log(`Client requested rates for base currency: ${baseCurrency}`);
         fetchAndBroadcastRates(baseCurrency);
