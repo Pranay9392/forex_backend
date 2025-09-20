@@ -3,12 +3,23 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const http = require('http');
+const { Server } = require('socket.io');
+const axios = require('axios');
 
 // Provided MongoDB URI
-const MONGO_URI = 'mongodb://localhost:27017/forex_trading_app'; // Change as needed
+const MONGO_URI = 'mongodb://localhost:27017/forex_trading_app';
 const JWT_SECRET = 'your-super-strong-jwt-secret'; // IMPORTANT: Change this in a real application
+const EXCHANGERATE_API_KEY = '8054406b211345b306fc684e';
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+  }
+});
+
 const PORT = 3000;
 
 // Middleware
@@ -58,7 +69,7 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// --- API Endpoints ---
+// --- REST API Endpoints ---
 
 // User Signup
 app.post('/api/signup', async (req, res) => {
@@ -147,9 +158,58 @@ app.get('/api/analytics', authenticateToken, async (req, res) => {
   }
 });
 
+// --- WebSocket Handlers ---
+io.on('connection', (socket) => {
+  console.log('A user connected via WebSocket');
+
+  // Request latest rates for a base currency
+  socket.on('request_latest_rates', async (baseCurrency) => {
+    try {
+      const response = await axios.get(`https://v6.exchangerate-api.com/v6/${EXCHANGERATE_API_KEY}/latest/${baseCurrency}`);
+      socket.emit('latest_rates_update', response.data);
+    } catch (error) {
+      console.error('Error fetching latest rates:', error);
+      socket.emit('error', 'Failed to fetch latest rates.');
+    }
+  });
+
+  // Request historical rates for a base currency (simulated for demo)
+  socket.on('request_historical_data', (data) => {
+    console.log(`Received request for historical data: ${JSON.stringify(data)}`);
+    const { baseCurrency, dateRange } = data;
+    const historicalRates = [];
+    const endDate = new Date();
+    for (let i = 0; i < 30; i++) {
+        const date = new Date();
+        date.setDate(endDate.getDate() - i);
+        historicalRates.push({
+            date: date.toISOString().split('T')[0],
+            rate: 1.2 + (Math.random() - 0.5) * 0.1, // Simulated rates
+        });
+    }
+    socket.emit('historical_data_update', historicalRates);
+  });
+
+  // Request list of all currencies
+  socket.on('request_currencies', async () => {
+    try {
+      const response = await axios.get(`https://v6.exchangerate-api.com/v6/${EXCHANGERATE_API_KEY}/latest/USD`);
+      const currencies = Object.keys(response.data.conversion_rates);
+      socket.emit('currencies_list', currencies);
+    } catch (error) {
+      console.error('Error fetching currencies:', error);
+      socket.emit('error', 'Failed to fetch currency list.');
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('A user disconnected');
+  });
+});
+
 // Start the server after connecting to the database
 connectDB().then(() => {
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log(`Express server listening at http://localhost:${PORT}`);
   });
 });
